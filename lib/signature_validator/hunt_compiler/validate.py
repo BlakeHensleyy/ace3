@@ -757,6 +757,10 @@ def main():
                 print()
             continue
 
+        for warning in result.get("warnings") or []:
+            prefix = f"{file_path}: " if multiple_files else ""
+            print(f"\033[93m{prefix}WARNING: {warning}\033[0m")
+
         executing_hunt = (
             (effective_start_time is not None and args.end_time is not None)
             or query_results_override is not None

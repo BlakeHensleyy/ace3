@@ -3,7 +3,15 @@ import logging
 import pytest
 from pydantic import ValidationError
 
-from saq.constants import F_FILE, F_FILE_LOCATION, F_HOSTNAME, F_IP, F_USER, SUMMARY_DETAIL_FORMAT_JINJA
+from saq.constants import (
+    F_FILE,
+    F_FILE_LOCATION,
+    F_HOSTNAME,
+    F_IP,
+    F_USER,
+    SUMMARY_DETAIL_FORMAT_JINJA,
+    SUMMARY_DETAIL_FORMAT_TXT,
+)
 from saq.observables.mapping import (
     ObservableMapping,
     RelationshipMapping,
@@ -13,6 +21,7 @@ from saq.observables.type_hierarchy import get_type_hierarchy
 from saq.query.config import SummaryDetailConfig
 from saq.query.decoder import DecoderType
 from saq.query.extraction import (
+    SUMMARY_DETAIL_RENDER_ERROR_HEADER,
     extract_observables_from_event,
     interpret_event_value,
     process_summary_details,
@@ -807,7 +816,7 @@ def test_process_summary_details_limit():
 
 @pytest.mark.unit
 def test_process_summary_details_unresolved_placeholders_skipped():
-    """Test that events with unresolved placeholders are skipped."""
+    """Test that events with unresolved placeholders are skipped, leaving a notice behind."""
     configs = [
         SummaryDetailConfig(content="{{ missing_field }}"),
     ]
@@ -815,11 +824,16 @@ def test_process_summary_details_unresolved_placeholders_skipped():
 
     details = []
     def add_detail(content, header, fmt):
-        details.append(content)
+        details.append({"content": content, "header": header, "format": fmt})
 
     process_summary_details(configs, results, add_detail)
 
-    assert len(details) == 0
+    # nothing rendered, so the analyst gets one notice instead of silence
+    assert len(details) == 1
+    assert details[0]["header"] == SUMMARY_DETAIL_RENDER_ERROR_HEADER
+    assert details[0]["format"] == SUMMARY_DETAIL_FORMAT_TXT
+    assert "missing_field" in details[0]["content"]
+    assert "required_fields" in details[0]["content"]
 
 
 @pytest.mark.unit
@@ -873,7 +887,7 @@ def test_process_summary_details_grouped_limit(caplog):
 
 @pytest.mark.unit
 def test_process_summary_details_grouped_no_matching_events():
-    """Test grouped summary details produce no detail when all events fail interpolation."""
+    """Grouped details produce only a render notice when every event fails interpolation."""
     configs = [
         SummaryDetailConfig(content="{{ missing }}", grouped=True),
     ]
@@ -881,11 +895,13 @@ def test_process_summary_details_grouped_no_matching_events():
 
     details = []
     def add_detail(content, header, fmt):
-        details.append(content)
+        details.append({"content": content, "header": header, "format": fmt})
 
     process_summary_details(configs, results, add_detail)
 
-    assert len(details) == 0
+    assert len(details) == 1
+    assert details[0]["format"] == SUMMARY_DETAIL_FORMAT_TXT
+    assert "missing" in details[0]["content"]
 
 
 @pytest.mark.unit
@@ -973,11 +989,14 @@ def test_process_summary_details_jinja_missing_field_strict_skipped():
 
     details = []
     def add_detail(content, header, fmt):
-        details.append(content)
+        details.append({"content": content, "header": header, "format": fmt})
 
     process_summary_details(configs, results, add_detail)
 
-    assert len(details) == 0
+    # the event's content is dropped; only the render notice remains
+    assert len(details) == 1
+    assert details[0]["format"] == SUMMARY_DETAIL_FORMAT_TXT
+    assert "missing_field" in details[0]["content"]
 
 
 @pytest.mark.unit
@@ -1003,12 +1022,15 @@ def test_process_summary_details_grouped_jinja_missing_field_skipped():
 
     details = []
     def add_detail(content, header, fmt):
-        details.append(content)
+        details.append({"content": content, "header": header, "format": fmt})
 
     # must not raise
     process_summary_details(configs, results, add_detail)
 
-    assert len(details) == 0
+    # the block is dropped, replaced by a notice explaining why
+    assert len(details) == 1
+    assert details[0]["format"] == SUMMARY_DETAIL_FORMAT_TXT
+    assert "sometimes" in details[0]["content"]
 
 
 @pytest.mark.unit
@@ -1462,3 +1484,101 @@ def test_process_summary_details_grouped_jinja_with_header():
 
     assert len(details) == 1
     assert details[0]["header"] == "Hosts for web"
+
+
+# --- Render failure visibility ---
+
+
+@pytest.mark.unit
+def test_process_summary_details_header_failure_keeps_content():
+    """A header that cannot render must not cost the analyst content that rendered fine."""
+    configs = [
+        SummaryDetailConfig(content="IP: {{ src_ip }}", header="Seen by {{ sensor }}"),
+    ]
+    results = [{"src_ip": "10.0.0.1"}]
+
+    details = []
+    def add_detail(content, header, fmt):
+        details.append({"content": content, "header": header, "format": fmt})
+
+    process_summary_details(configs, results, add_detail)
+
+    assert len(details) == 1
+    assert details[0]["content"] == "IP: 10.0.0.1"
+    assert details[0]["header"] is None
+
+
+@pytest.mark.unit
+def test_process_summary_details_partial_render_failure_emits_no_notice():
+    """One event failing to render is not a visible failure — the others still carry it."""
+    configs = [
+        SummaryDetailConfig(content="IP: {{ src_ip }}"),
+    ]
+    results = [{"src_ip": "10.0.0.1"}, {"other": "value"}]
+
+    details = []
+    def add_detail(content, header, fmt):
+        details.append({"content": content, "header": header, "format": fmt})
+
+    process_summary_details(configs, results, add_detail)
+
+    assert len(details) == 1
+    assert details[0]["content"] == "IP: 10.0.0.1"
+
+
+@pytest.mark.unit
+def test_process_summary_details_render_notice_uses_static_header():
+    """A static header identifies which block failed; a templated one is not shown raw."""
+    static_configs = [
+        SummaryDetailConfig(content="{{ missing }}", header="Login history"),
+    ]
+    templated_configs = [
+        SummaryDetailConfig(content="{{ missing }}", header="Login history for {{ nope }}"),
+    ]
+    results = [{"other": "value"}]
+
+    details = []
+    def add_detail(content, header, fmt):
+        details.append({"content": content, "header": header, "format": fmt})
+
+    process_summary_details(static_configs, results, add_detail)
+    process_summary_details(templated_configs, results, add_detail)
+
+    assert len(details) == 2
+    assert details[0]["header"] == "Login history"
+    assert details[1]["header"] == SUMMARY_DETAIL_RENDER_ERROR_HEADER
+
+
+@pytest.mark.unit
+def test_process_summary_details_required_fields_filtered_emits_no_notice():
+    """required_fields filtering everything out is 'nothing to show', not a render failure."""
+    configs = [
+        SummaryDetailConfig(content="IP: {{ src_ip }}", required_fields=["src_ip"]),
+        SummaryDetailConfig(content="IP: {{ src_ip }}", required_fields=["src_ip"], grouped=True),
+    ]
+    results = [{"other": "value"}]
+
+    details = []
+    def add_detail(content, header, fmt):
+        details.append(content)
+
+    process_summary_details(configs, results, add_detail)
+
+    assert len(details) == 0
+
+
+@pytest.mark.unit
+def test_process_summary_details_render_notice_emitted_once_per_config():
+    """Many failing events produce exactly one notice, not one per event."""
+    configs = [
+        SummaryDetailConfig(content="{{ missing }}"),
+    ]
+    results = [{"other": i} for i in range(10)]
+
+    details = []
+    def add_detail(content, header, fmt):
+        details.append(content)
+
+    process_summary_details(configs, results, add_detail)
+
+    assert len(details) == 1

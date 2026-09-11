@@ -4199,7 +4199,7 @@ def test_summary_details_ungrouped_multiple_events(monkeypatch):
 
 @pytest.mark.unit
 def test_summary_details_ungrouped_missing_field_skipped(monkeypatch):
-    """test that events with missing fields are silently skipped"""
+    """test that events with missing fields are skipped, leaving a notice for the analyst"""
     import saq.collectors.hunter.query_hunter
     monkeypatch.setattr(saq.collectors.hunter.query_hunter, "local_time", mock_local_time)
 
@@ -4213,7 +4213,10 @@ def test_summary_details_ungrouped_missing_field_skipped(monkeypatch):
     )
     submissions = hunt.process_query_results([{"other": "value"}])
     assert len(submissions) == 1
-    assert len(submissions[0].root.summary_details) == 0
+    sd_list = submissions[0].root.summary_details
+    assert len(sd_list) == 1
+    assert sd_list[0].format == SUMMARY_DETAIL_FORMAT_TXT
+    assert "missing_field" in sd_list[0].content
 
 
 @pytest.mark.unit
@@ -4368,7 +4371,7 @@ def test_summary_details_grouped_limit(monkeypatch, caplog):
 
 @pytest.mark.unit
 def test_summary_details_grouped_no_matching_events(monkeypatch):
-    """test grouped - no summary detail added when all events are skipped"""
+    """test grouped - only a render notice is added when every event fails to render"""
     import saq.collectors.hunter.query_hunter
     monkeypatch.setattr(saq.collectors.hunter.query_hunter, "local_time", mock_local_time)
 
@@ -4385,7 +4388,10 @@ def test_summary_details_grouped_no_matching_events(monkeypatch):
         {"other": "value2"},
     ])
     assert len(submissions) == 1
-    assert len(submissions[0].root.summary_details) == 0
+    sd_list = submissions[0].root.summary_details
+    assert len(sd_list) == 1
+    assert sd_list[0].format == SUMMARY_DETAIL_FORMAT_TXT
+    assert "missing" in sd_list[0].content
 
 
 @pytest.mark.unit
@@ -4518,7 +4524,10 @@ def test_summary_details_jinja_missing_field_strict_skipped(monkeypatch):
     )
     submissions = hunt.process_query_results([{"other": "value"}])
     assert len(submissions) == 1
-    assert len(submissions[0].root.summary_details) == 0
+    sd_list = submissions[0].root.summary_details
+    # the event's content is dropped; only the render notice remains
+    assert len(sd_list) == 1
+    assert sd_list[0].format == SUMMARY_DETAIL_FORMAT_TXT
 
 
 # --- Dedup fields tests ---
@@ -4758,7 +4767,89 @@ def test_summary_details_grouped_jinja_missing_field_does_not_kill_alert(monkeyp
         {"always": "b"},
     ])
     assert len(submissions) == 1
-    # the faulty block is dropped, but the alert still fires
+    # the faulty block is dropped, but the alert still fires — with a notice explaining why
+    sd_list = submissions[0].root.summary_details
+    assert len(sd_list) == 1
+    assert sd_list[0].format == SUMMARY_DETAIL_FORMAT_TXT
+    assert "sometimes" in sd_list[0].content
+
+
+@pytest.mark.unit
+def test_summary_details_header_failure_keeps_content(monkeypatch):
+    """A header that cannot render must not cost the analyst content that rendered fine."""
+    import saq.collectors.hunter.query_hunter
+    monkeypatch.setattr(saq.collectors.hunter.query_hunter, "local_time", mock_local_time)
+
+    hunt = default_hunt(
+        manager=MockManager(),
+        name="test_sd_header_failure",
+        group_by=None,
+        summary_details=[
+            SummaryDetailConfig(content="{{ host }}", header="Seen by {{ sensor }}"),
+        ],
+    )
+    submissions = hunt.process_query_results([{"host": "server1"}])
+    assert len(submissions) == 1
+    sd_list = submissions[0].root.summary_details
+    assert len(sd_list) == 1
+    assert sd_list[0].content == "server1"
+    assert sd_list[0].header is None
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("grouped", [False, True])
+def test_summary_details_render_notice_is_per_submission(monkeypatch, grouped):
+    """Only the submission whose events all failed to render gets the notice."""
+    import saq.collectors.hunter.query_hunter
+    monkeypatch.setattr(saq.collectors.hunter.query_hunter, "local_time", mock_local_time)
+
+    hunt = default_hunt(
+        manager=MockManager(),
+        name="test_sd_notice_per_submission",
+        group_by="group_field",
+        summary_details=[
+            SummaryDetailConfig(content="{{ host }}", grouped=grouped),
+        ],
+    )
+    submissions = hunt.process_query_results([
+        {"group_field": "group_a", "host": "server1"},
+        {"group_field": "group_b", "other": "value"},
+    ])
+    assert len(submissions) == 2
+
+    good = next(s for s in submissions if "group_a" in s.root.description).root.summary_details
+    assert len(good) == 1
+    assert good[0].content == "server1"
+
+    bad = next(s for s in submissions if "group_b" in s.root.description).root.summary_details
+    assert len(bad) == 1
+    assert bad[0].format == SUMMARY_DETAIL_FORMAT_TXT
+    assert "host" in bad[0].content
+
+
+@pytest.mark.unit
+def test_summary_details_required_fields_filtered_emits_no_notice(monkeypatch):
+    """required_fields filtering everything out is 'nothing to show', not a render failure."""
+    import saq.collectors.hunter.query_hunter
+    monkeypatch.setattr(saq.collectors.hunter.query_hunter, "local_time", mock_local_time)
+
+    hunt = default_hunt(
+        manager=MockManager(),
+        name="test_sd_required_no_notice",
+        group_by="ALL",
+        summary_details=[
+            SummaryDetailConfig(content="{{ host }}", required_fields=["host"]),
+            SummaryDetailConfig(content="{{ host }}", required_fields=["host"], grouped=True),
+            SummaryDetailConfig(
+                content="{% for e in events %}{{ e.host }}{% endfor %}",
+                format=SUMMARY_DETAIL_FORMAT_JINJA,
+                grouped=True,
+                required_fields=["host"],
+            ),
+        ],
+    )
+    submissions = hunt.process_query_results([{"other": "value"}])
+    assert len(submissions) == 1
     assert len(submissions[0].root.summary_details) == 0
 
 

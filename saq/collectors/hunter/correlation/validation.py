@@ -22,6 +22,8 @@ from saq.collectors.hunter.correlation.schema import (
 )
 from saq.configuration.config import get_config
 from saq.configuration.yaml_parser import ENCRYPTED_PREFIX
+from saq.observables.mapping import ObservableMapping
+from saq.query.config import SummaryDetailConfig
 
 _jinja_env = SandboxedEnvironment()
 
@@ -51,6 +53,23 @@ def iter_correlate_commands(logic_steps: list[StepConfig]) -> Iterator[CommandCo
             yield from iter_correlate_commands(inner.execute)
             if inner.else_:
                 yield from iter_correlate_commands(inner.else_)
+
+
+def iter_correlate_property_names(logic_steps: list[StepConfig]) -> Iterator[str]:
+    """Yield the property_name of every property transform in a logic tree, in document order.
+
+    Same traversal as iter_correlate_commands; only `method: property` transforms write a
+    named value onto the event, so those are the only ones with output to account for.
+    """
+    for step_config in logic_steps:
+        inner = step_config.step
+        if isinstance(inner, TransformConfig):
+            if inner.method == "property" and inner.property_name:
+                yield inner.property_name
+        elif isinstance(inner, ConditionConfig):
+            yield from iter_correlate_property_names(inner.execute)
+            if inner.else_:
+                yield from iter_correlate_property_names(inner.else_)
 
 
 def check_env_for_encrypted_markers(
@@ -109,3 +128,97 @@ def check_env_for_encrypted_markers(
                 )
 
     return errors
+
+
+def _mapping_field_roots(mapping: ObservableMapping) -> Iterator[str]:
+    """Yield the field names a mapping reads, plus the root segment of each.
+
+    A `field_lookup_type: dot` mapping walks a path (`correlated_logs.*.username`), so the
+    correlate property it consumes is the first segment, not the whole spec.
+    """
+    for field in mapping.get_fields():
+        yield field
+        root = field.split(".")[0].rstrip("*")
+        if root:
+            yield root
+
+
+def _mapping_templates(mapping: ObservableMapping) -> Iterator[str]:
+    """Yield every per-event template string on a mapping that renders into the alert."""
+    for value in (mapping.value, mapping.type, mapping.display_value, mapping.file_name):
+        if value:
+            yield value
+    yield from (t for t in mapping.tags if t)
+    for relationship in mapping.relationships:
+        if relationship.target.value:
+            yield relationship.target.value
+
+
+def check_correlate_output_reaches_analyst(
+    correlate_config: Optional[CorrelateConfig],
+    observable_mapping: Optional[list[ObservableMapping]] = None,
+    summary_details: Optional[list[SummaryDetailConfig]] = None,
+    extra_templates: Optional[list[str]] = None,
+) -> list[str]:
+    """Return one warning string per correlate property whose output never reaches the analyst.
+
+    A `property` transform's value is added to the event, but the only ways it becomes
+    visible are an observable_mapping that reads the field or a template that renders it.
+    A property that neither does is computed, used to steer `when:` branching, and then
+    discarded -- which is legitimate for a control-flow boolean and a silent loss of
+    evidence for anything else, so this warns rather than rejects.
+
+    Args:
+        correlate_config: the hunt's correlate block.
+        observable_mapping: the hunt's observable_mapping entries.
+        summary_details: the hunt's summary_details entries.
+        extra_templates: any other per-event template strings whose rendered output the
+            analyst sees (hunt tags, pivot link url/text, description_field, ...).
+    """
+    if not isinstance(correlate_config, CorrelateConfig):
+        return []
+
+    property_names: list[str] = []
+    for name in iter_correlate_property_names(correlate_config.logic):
+        if name not in property_names:
+            property_names.append(name)
+    if not property_names:
+        return []
+
+    referenced_fields: set[str] = set()
+    templates: list[str] = []
+
+    if isinstance(observable_mapping, list):
+        for mapping in observable_mapping:
+            if not isinstance(mapping, ObservableMapping):
+                continue
+            referenced_fields.update(_mapping_field_roots(mapping))
+            templates.extend(_mapping_templates(mapping))
+
+    if isinstance(summary_details, list):
+        for sd_config in summary_details:
+            if not isinstance(sd_config, SummaryDetailConfig):
+                continue
+            templates.append(sd_config.content)
+            if sd_config.header:
+                templates.append(sd_config.header)
+
+    if extra_templates:
+        templates.extend(t for t in extra_templates if t)
+
+    # substring match over the joined templates: a property is referenced as
+    # `{{ name }}`, `_event['name']`, `events | map(attribute='name')` and more, and a
+    # false negative here (no warning) is cheaper than a false positive on a hunt that
+    # does surface the value in a shape a stricter parser would miss.
+    template_text = "\n".join(templates)
+
+    warnings = []
+    for name in property_names:
+        if name in referenced_fields or name in template_text:
+            continue
+        warnings.append(
+            f"correlate property {name!r} is never referenced by summary_details or "
+            f"observable_mapping, so its output never reaches the analyst"
+        )
+
+    return warnings

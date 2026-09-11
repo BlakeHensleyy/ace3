@@ -437,6 +437,8 @@ A summary detail has the following fields:
 - `required_fields` (list of strings, optional): Fields that must be present **and non-empty** in the event for the summary to be generated.
 
 > If a summary detail specifies an event field for interpolation and that event field does not exist in the event, then that summary detail is skipped for that event.
+>
+> If *every* event fails that way, so the summary detail would produce nothing at all, a plain-text notice naming the missing field is added in its place. Otherwise a block that silently disappears is indistinguishable to the analyst from the hunt having found nothing. Set `required_fields` to filter out the partial events and the block goes back to being omitted quietly. An unrenderable `header` never drops content: the detail is added without one.
 
 The `format` field supports the following values:
 

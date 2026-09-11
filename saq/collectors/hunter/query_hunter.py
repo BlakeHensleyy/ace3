@@ -21,7 +21,7 @@ from saq.collectors.hunter import Hunt, read_persistence_data, write_persistence
 from saq.collectors.hunter.base_hunter import HuntConfig
 from saq.collectors.hunter.loader import load_from_yaml
 from saq.configuration.config import get_config
-from saq.constants import ANALYSIS_MODE_CORRELATION, F_SIGNATURE_ID, SUMMARY_DETAIL_FORMAT_JINJA, TIMESPEC_TOKEN
+from saq.constants import ANALYSIS_MODE_CORRELATION, F_SIGNATURE_ID, SUMMARY_DETAIL_FORMAT_JINJA, SUMMARY_DETAIL_FORMAT_TXT, TIMESPEC_TOKEN
 from saq.collectors.submission_file_manager import get_staging_tmp_dir
 from saq.gui.alert import KEY_ALERT_TEMPLATE, KEY_ICON_CONFIGURATION
 from saq.logging import DEFAULT_TRANSACTION_ID, get_transaction_id
@@ -38,6 +38,7 @@ from saq.query.template_rendering import (
     render_event_templates_multi,
 )
 from saq.query.extraction import (
+    build_render_error_notice,
     compute_dedup_key,
     event_has_required_fields,
     extract_observables_from_event,
@@ -539,6 +540,14 @@ class QueryHunt(Hunt):
         """Add one SummaryDetail per event per submission for this definition."""
         count: dict[int, int] = {}  # submission id -> count
         seen_keys: dict[int, set[tuple]] = {}  # submission id -> set of dedup keys
+        # submission id -> (submission, first render error, the event that failed)
+        render_errors: dict[int, tuple[Submission, UndefinedError, dict]] = {}
+        current_event: Optional[dict] = None
+        current_submissions: list[Submission] = []
+
+        def record_error(error: UndefinedError):
+            for submission in current_submissions:
+                render_errors.setdefault(id(submission), (submission, error, current_event))
 
         for event_index, event in enumerate(query_results):
             if event_index not in event_submission_map:
@@ -550,14 +559,16 @@ class QueryHunt(Hunt):
                     continue
 
             # render content
-            content = render_sd_content(sd_config, event)
+            current_event = event
+            current_submissions = event_submission_map[event_index]
+            content = render_sd_content(sd_config, event, on_error=record_error)
             if content is None:
                 continue
 
-            # render header
+            # render header — a header that cannot be rendered is not worth discarding content over
             header_ok, header = render_sd_header(sd_config, event)
             if not header_ok:
-                continue
+                header = None
 
             for submission in event_submission_map[event_index]:
                 sub_id = id(submission)
@@ -583,18 +594,44 @@ class QueryHunt(Hunt):
                 submission.root.add_summary_detail(header=header, content=content, format=sd_config.format)
                 count[sub_id] = current_count + 1
 
+        self._add_render_error_notices(sd_config, render_errors, count)
+
+    def _add_render_error_notices(
+        self,
+        sd_config: SummaryDetailConfig,
+        render_errors: dict[int, tuple[Submission, UndefinedError, dict]],
+        rendered_counts: dict[int, int],
+    ):
+        """Leave one notice per submission that hit a render error and ended up with nothing.
+
+        A dropped block is otherwise indistinguishable from the hunt having found nothing
+        for it, so the analyst gets no signal at all that evidence is missing.
+        """
+        for sub_id, (submission, error, event) in render_errors.items():
+            if rendered_counts.get(sub_id, 0) > 0:
+                continue
+            logging.warning(
+                "summary detail rendered no content for definition content=%s in hunt %s: %s",
+                sd_config.content, self.name, error,
+            )
+            header, content = build_render_error_notice(sd_config, error, event)
+            submission.root.add_summary_detail(
+                header=header, content=content, format=SUMMARY_DETAIL_FORMAT_TXT,
+            )
+
     def _collect_grouped_events(
         self,
         sd_config: SummaryDetailConfig,
         query_results: list[dict],
         event_submission_map: dict[int, list[Submission]],
-        transform_event: Callable[[dict], Optional[T]],
+        transform_event: Callable[[dict, list[Submission]], Optional[T]],
     ) -> tuple[dict[int, list[T]], dict[int, Submission], dict[int, dict]]:
         """Shared collection loop for grouped summary details.
 
         Iterates query results, applies required_fields filtering, per-submission
         dedup, and limit enforcement.  The ``transform_event`` callback converts
-        each qualifying event into the item to collect (or returns ``None`` to skip).
+        each qualifying event (and the submissions it belongs to) into the item to
+        collect (or returns ``None`` to skip).
 
         Returns ``(collected, sub_lookup, first_events)`` where *collected* maps
         submission id to the list of transformed items, *sub_lookup* maps
@@ -614,7 +651,7 @@ class QueryHunt(Hunt):
                 if not event_has_required_fields(event, sd_config.required_fields):
                     continue
 
-            item = transform_event(event)
+            item = transform_event(event, event_submission_map[event_index])
             if item is None:
                 continue
 
@@ -677,7 +714,7 @@ class QueryHunt(Hunt):
         """Jinja grouped mode: collect qualifying events per submission, render once per submission."""
         collected, sub_lookup, first_events = self._collect_grouped_events(
             sd_config, query_results, event_submission_map,
-            transform_event=lambda e: e,
+            transform_event=lambda e, _subs: e,
         )
 
         for sub_id, events in collected.items():
@@ -685,17 +722,24 @@ class QueryHunt(Hunt):
                 continue
 
             # A missing field under strict mode raises UndefinedError. Mirror every other
-            # summary-detail path and skip just this block (rather than killing the hunt).
+            # summary-detail path and skip just this block (rather than killing the hunt),
+            # leaving a notice behind so the gap is visible to the analyst.
             try:
                 content = render_jinja_template(
                     sd_config.content,
                     {"events": events},
                     strict=(sd_config.required_fields is None),
                 )
-            except UndefinedError:
+            except UndefinedError as e:
                 logging.error(
                     "grouped jinja summary detail skipped (missing field) for content=%s in hunt %s",
                     sd_config.content, self.name, exc_info=True,
+                )
+                notice_header, notice_content = build_render_error_notice(
+                    sd_config, e, first_events[sub_id],
+                )
+                sub_lookup[sub_id].root.add_summary_detail(
+                    header=notice_header, content=notice_content, format=SUMMARY_DETAIL_FORMAT_TXT,
                 )
                 continue
 
@@ -714,9 +758,26 @@ class QueryHunt(Hunt):
         event_submission_map: dict[int, list[Submission]],
     ):
         """Non-Jinja grouped mode: per-event render + join."""
+        # submission id -> (submission, first render error, the event that failed). Tracked
+        # here rather than in _collect_grouped_events because a submission whose every event
+        # fails to render never gets an entry there at all.
+        render_errors: dict[int, tuple[Submission, UndefinedError, dict]] = {}
+        current_event: Optional[dict] = None
+        current_submissions: list[Submission] = []
+
+        def record_error(error: UndefinedError):
+            for submission in current_submissions:
+                render_errors.setdefault(id(submission), (submission, error, current_event))
+
+        def transform_event(event: dict, submissions: list[Submission]) -> Optional[str]:
+            nonlocal current_event, current_submissions
+            current_event = event
+            current_submissions = submissions
+            return render_sd_content(sd_config, event, on_error=record_error)
+
         collected, sub_lookup, first_events = self._collect_grouped_events(
             sd_config, query_results, event_submission_map,
-            transform_event=lambda e: render_sd_content(sd_config, e),
+            transform_event=transform_event,
         )
 
         for sub_id, lines in collected.items():
@@ -726,6 +787,10 @@ class QueryHunt(Hunt):
             sub_lookup[sub_id].root.add_summary_detail(
                 header=header, content="\n".join(lines), format=sd_config.format,
             )
+
+        self._add_render_error_notices(
+            sd_config, render_errors, {sub_id: len(lines) for sub_id, lines in collected.items()},
+        )
 
     def _extract_event_summary(self, event: dict, observables: list) -> Optional[str]:
         """Build a short, human-readable one-line summary for a single event.

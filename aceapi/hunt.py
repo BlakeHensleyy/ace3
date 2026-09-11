@@ -17,7 +17,10 @@ from aceapi.blueprints import hunt_bp
 from hunt_compiler import CompiledHunt, load_compiled_hunt
 from saq.analysis.root import RootAnalysis
 from saq.collectors.hunter.correlation.sources import load_query_sources_from_config
-from saq.collectors.hunter.correlation.validation import check_env_for_encrypted_markers
+from saq.collectors.hunter.correlation.validation import (
+    check_correlate_output_reaches_analyst,
+    check_env_for_encrypted_markers,
+)
 from saq.collectors.hunter.loader import peek_hunt_type
 from saq.collectors.hunter.query_hunter import QueryHunt
 from saq.collectors.hunter.service import HunterService
@@ -27,6 +30,7 @@ from saq.error.remote import RemoteApiError
 from saq.database.util.alert import ALERT
 from saq.environment import get_data_dir
 from saq.logging import suppress_external_logging
+from saq.query.config import PivotLinkConfig
 from saq.util.uuid import storage_dir_from_uuid
 
 
@@ -83,6 +87,35 @@ class ExecutionArguments(BaseModel):
     correlate_results: Optional[dict] = None
 
 
+def _analyst_visible_templates(hunt_config) -> list[str]:
+    """Hunt-config strings rendered against an event whose output an analyst can see.
+
+    Used to decide whether a correlate property's value makes it into the alert by some
+    route other than summary_details / observable_mapping. Every read is type-checked:
+    hunt types other than QueryHunt do not carry all of these.
+    """
+    templates: list[str] = []
+    for attribute in ("group_by", "description_field", "dedup_key", "playbook_url"):
+        value = getattr(hunt_config, attribute, None)
+        if isinstance(value, str) and value:
+            templates.append(value)
+
+    tags = getattr(hunt_config, "tags", None)
+    if isinstance(tags, list):
+        templates.extend(t for t in tags if isinstance(t, str) and t)
+
+    pivot_links = getattr(hunt_config, "pivot_links", None)
+    if isinstance(pivot_links, list):
+        for pivot_link in pivot_links:
+            if not isinstance(pivot_link, PivotLinkConfig):
+                continue
+            templates.extend(t for t in (pivot_link.url, pivot_link.text) if t)
+            if pivot_link.overflow is not None:
+                templates.extend(t for t in (pivot_link.overflow.url, pivot_link.overflow.text) if t)
+
+    return templates
+
+
 def _validate_and_execute(target_file_path: str, request_json: dict):
     """Validate and optionally execute a hunt from its target file path.
 
@@ -128,10 +161,20 @@ def _validate_and_execute(target_file_path: str, request_json: dict):
     if env_errors:
         return json_result({"valid": False, "error": "; ".join(env_errors)}), 400
 
+    # a correlate property that nothing renders or maps is computed and then dropped. this is
+    # legitimate for a boolean that only gates a `when:` branch, so it is reported as a
+    # non-blocking warning rather than a validation failure.
+    correlate_warnings = check_correlate_output_reaches_analyst(
+        getattr(hunt_config, "correlate", None),
+        getattr(hunt_config, "observable_mapping", None),
+        getattr(hunt_config, "summary_details", None),
+        extra_templates=_analyst_visible_templates(hunt_config),
+    )
+
     # are we executing the hunt?
     execution_arguments_dict = request_json.get("execution_arguments", {})
     if not execution_arguments_dict:
-        return json_result({"valid": True}), 200
+        return json_result({"valid": True, "warnings": correlate_warnings}), 200
 
     try:
         execution_arguments = ExecutionArguments.model_validate(execution_arguments_dict)
@@ -249,6 +292,7 @@ def _validate_and_execute(target_file_path: str, request_json: dict):
 
         return json_result({
             "valid": True,
+            "warnings": correlate_warnings,
             "roots": root_json_results,
             "logs": formatted_logs,
             "correlation_trace": correlation_trace,

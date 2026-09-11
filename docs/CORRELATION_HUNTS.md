@@ -131,6 +131,12 @@ The `property_type` controls how the output is interpreted. The possible values 
 - dict: Output is interpreted as JSON. The value of the field is a dict.
 - TYPE: Output is passed to TYPE which is a Python supported data type, such as str, int, float, bool, etc... The default value is str.
 
+The property becomes part of the event stream, so it is available to `observable_mapping` and to any interpolated hunt setting — but only those routes put it in front of an analyst. A property that no `observable_mapping` reads and no template renders is computed, used for `when:` branching, and then discarded. That is fine for a boolean that only gates a branch, so hunt validation reports it as a warning rather than an error:
+
+```txt
+WARNING: correlate property 'manager_email' is never referenced by summary_details or observable_mapping, so its output never reaches the analyst
+```
+
 ##### merge
 
 A `merge` is only valid for a `stream transformation`.

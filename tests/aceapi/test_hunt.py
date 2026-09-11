@@ -1,8 +1,11 @@
 import pytest
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from hunt_compiler.models import CompiledHunt, EmbeddedFile
+from saq.collectors.hunter.correlation.schema import CorrelateConfig
 from saq.configuration.config import get_config
+from saq.query.config import SummaryDetailConfig
 
 
 # Valid hunt YAML content for reuse in tests
@@ -305,6 +308,83 @@ def test_validate_hunt_valid_hunt_with_mock(test_client, auth_headers):
         assert result.status_code == 200
         data = result.get_json()
         assert data["valid"] is True
+
+
+def _hunt_with_correlate_property(summary_detail_content=None):
+    """A hunt stand-in whose correlate block writes one property."""
+    correlate = CorrelateConfig.model_validate({
+        "logic": [
+            {
+                "transform": {
+                    "type": "event",
+                    "method": "property",
+                    "property_name": "manager_email",
+                    "command": {"type": "defined", "name": "lookup_manager"},
+                },
+            },
+        ],
+    })
+    summary_details = []
+    if summary_detail_content is not None:
+        summary_details.append(SummaryDetailConfig(content=summary_detail_content))
+    hunt = Mock()
+    hunt.config = SimpleNamespace(
+        correlate=correlate,
+        observable_mapping=[],
+        summary_details=summary_details,
+        tags=[],
+        pivot_links=[],
+        group_by=None,
+        description_field=None,
+        dedup_key=None,
+        playbook_url=None,
+    )
+    return hunt
+
+
+@pytest.mark.integration
+def test_validate_hunt_warns_on_unreferenced_correlate_property(test_client, auth_headers):
+    """A correlate property nothing renders is reported as a warning, not a failure."""
+    with patch("aceapi.hunt.HunterService") as mock_hunter_service:
+        mock_manager = Mock()
+        mock_manager.load_hunt_from_config.return_value = _hunt_with_correlate_property()
+        mock_instance = mock_hunter_service.return_value
+        mock_instance.hunt_managers = {"test": mock_manager}
+        mock_instance.load_hunt_managers = Mock()
+
+        result = test_client.post(
+            HUNT_VALIDATE_URL,
+            json=_make_compiled_payload(VALID_HUNT_YAML),
+            headers=auth_headers
+        )
+
+        assert result.status_code == 200
+        data = result.get_json()
+        assert data["valid"] is True
+        assert len(data["warnings"]) == 1
+        assert "manager_email" in data["warnings"][0]
+
+
+@pytest.mark.integration
+def test_validate_hunt_no_warning_when_correlate_property_is_rendered(test_client, auth_headers):
+    """A correlate property a summary detail renders reaches the analyst — no warning."""
+    with patch("aceapi.hunt.HunterService") as mock_hunter_service:
+        mock_manager = Mock()
+        mock_manager.load_hunt_from_config.return_value = _hunt_with_correlate_property(
+            "manager: {{ manager_email }}",
+        )
+        mock_instance = mock_hunter_service.return_value
+        mock_instance.hunt_managers = {"test": mock_manager}
+        mock_instance.load_hunt_managers = Mock()
+
+        result = test_client.post(
+            HUNT_VALIDATE_URL,
+            json=_make_compiled_payload(VALID_HUNT_YAML),
+            headers=auth_headers
+        )
+
+        assert result.status_code == 200
+        assert result.get_json()["warnings"] == []
 
 
 @pytest.mark.integration
