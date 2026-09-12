@@ -10,7 +10,7 @@ from jinja2 import UndefinedError
 from pydantic import BaseModel, Field
 
 from saq.analysis.observable import Observable
-from saq.constants import F_FILE, SUMMARY_DETAIL_FORMAT_JINJA, SUMMARY_DETAIL_FORMAT_TXT
+from saq.constants import F_FILE, SUMMARY_DETAIL_FORMAT_JINJA
 from saq.observables.generator import create_observable
 from saq.observables.mapping import (
     ObservableMapping,
@@ -423,7 +423,8 @@ def build_render_error_notice(
     block whose content could not be rendered for any event.
 
     Without this the block simply never appears, which an analyst cannot tell apart
-    from the hunt having found nothing.
+    from the hunt having found nothing. Used by the hunt paths in query_hunter; the
+    API analysis path in this module still drops such a block silently.
     """
     resolved_header = None
     if sd_config.header is not None:
@@ -472,15 +473,6 @@ def process_ungrouped_summary_detail(
     """Process a single ungrouped summary detail config — one detail per event."""
     count = 0
     seen_keys: set[tuple] = set()
-    render_error: Optional[UndefinedError] = None
-    render_error_event: Optional[dict] = None
-    current_event: Optional[dict] = None
-
-    def record_error(error: UndefinedError):
-        nonlocal render_error, render_error_event
-        if render_error is None:
-            render_error = error
-            render_error_event = current_event
 
     for event in query_results:
         # required fields check
@@ -495,12 +487,12 @@ def process_ungrouped_summary_detail(
                 continue
             seen_keys.add(dedup_key)
 
-        current_event = event
-        content = render_sd_content(sd_config, event, on_error=record_error)
+        content = render_sd_content(sd_config, event)
         if content is None:
             continue
 
-        # a header that cannot be rendered is not worth discarding content over
+        # a header that cannot be rendered is not worth discarding content over — the
+        # grouped paths below already degrade this way
         header_ok, header = render_sd_header(sd_config, event)
         if not header_ok:
             header = None
@@ -516,16 +508,6 @@ def process_ungrouped_summary_detail(
 
         add_detail_fn(content, header, sd_config.format)
         count += 1
-
-    if count == 0 and render_error is not None:
-        logging.warning(
-            "summary detail rendered no content for definition content=%s: %s",
-            sd_config.content, render_error,
-        )
-        notice_header, notice_content = build_render_error_notice(
-            sd_config, render_error, render_error_event,
-        )
-        add_detail_fn(notice_content, notice_header, SUMMARY_DETAIL_FORMAT_TXT)
 
 
 def collect_qualifying_events(
@@ -570,21 +552,18 @@ def process_grouped_summary_detail(
             return
 
         # A missing field under strict mode raises UndefinedError. Mirror render_sd_content
-        # and skip just this block (rather than letting the error kill the whole analysis),
-        # leaving a notice behind so the gap is visible to the analyst.
+        # and skip just this block (rather than letting the error kill the whole analysis).
         try:
             content = render_jinja_template(
                 sd_config.content,
                 {"events": events},
                 strict=(sd_config.required_fields is None),
             )
-        except UndefinedError as e:
+        except UndefinedError:
             logging.warning(
                 "grouped jinja summary detail skipped (missing field) for content=%s",
                 sd_config.content, exc_info=True,
             )
-            notice_header, notice_content = build_render_error_notice(sd_config, e, events[0])
-            add_detail_fn(notice_content, notice_header, SUMMARY_DETAIL_FORMAT_TXT)
             return
         if content is None or not content.strip():
             return
@@ -603,15 +582,6 @@ def process_grouped_summary_detail(
     header: Optional[str] = None
     limit_warned = False
     seen_keys: set[tuple] = set()
-    render_error: Optional[UndefinedError] = None
-    render_error_event: Optional[dict] = None
-    current_event: Optional[dict] = None
-
-    def record_error(error: UndefinedError):
-        nonlocal render_error, render_error_event
-        if render_error is None:
-            render_error = error
-            render_error_event = current_event
 
     for event in query_results:
         # required fields check
@@ -626,8 +596,7 @@ def process_grouped_summary_detail(
                 continue
             seen_keys.add(dedup_key)
 
-        current_event = event
-        content = render_sd_content(sd_config, event, on_error=record_error)
+        content = render_sd_content(sd_config, event)
         if content is None:
             continue
 
@@ -650,12 +619,3 @@ def process_grouped_summary_detail(
 
     if lines:
         add_detail_fn("\n".join(lines), header, sd_config.format)
-    elif render_error is not None:
-        logging.warning(
-            "grouped summary detail rendered no content for definition content=%s: %s",
-            sd_config.content, render_error,
-        )
-        notice_header, notice_content = build_render_error_notice(
-            sd_config, render_error, render_error_event,
-        )
-        add_detail_fn(notice_content, notice_header, SUMMARY_DETAIL_FORMAT_TXT)

@@ -41,6 +41,7 @@ from saq.observables.mapping import (
     RelationshipMappingTarget,
 )
 from saq.query.config import SummaryDetailConfig
+from saq.query.extraction import SUMMARY_DETAIL_RENDER_ERROR_HEADER
 from saq.util.time import create_timedelta, local_time
 from tests.saq.helpers import create_submission_file_manager, log_count, wait_for_log_count
 
@@ -4851,6 +4852,48 @@ def test_summary_details_required_fields_filtered_emits_no_notice(monkeypatch):
     submissions = hunt.process_query_results([{"other": "value"}])
     assert len(submissions) == 1
     assert len(submissions[0].root.summary_details) == 0
+
+
+@pytest.mark.unit
+def test_summary_details_render_notice_uses_static_header(monkeypatch):
+    """A static header identifies which block failed; a templated one is not shown raw."""
+    import saq.collectors.hunter.query_hunter
+    monkeypatch.setattr(saq.collectors.hunter.query_hunter, "local_time", mock_local_time)
+
+    hunt = default_hunt(
+        manager=MockManager(),
+        name="test_sd_notice_header",
+        group_by="ALL",
+        summary_details=[
+            SummaryDetailConfig(content="{{ missing }}", header="Login history"),
+            SummaryDetailConfig(content="{{ missing }}", header="Logins for {{ nope }}"),
+        ],
+    )
+    submissions = hunt.process_query_results([{"other": "value"}])
+    assert len(submissions) == 1
+    sd_list = submissions[0].root.summary_details
+    assert len(sd_list) == 2
+    assert sd_list[0].header == "Login history"
+    assert sd_list[1].header == SUMMARY_DETAIL_RENDER_ERROR_HEADER
+
+
+@pytest.mark.unit
+def test_summary_details_render_notice_emitted_once_per_config(monkeypatch):
+    """Many failing events produce exactly one notice, not one per event."""
+    import saq.collectors.hunter.query_hunter
+    monkeypatch.setattr(saq.collectors.hunter.query_hunter, "local_time", mock_local_time)
+
+    hunt = default_hunt(
+        manager=MockManager(),
+        name="test_sd_notice_once",
+        group_by="ALL",
+        summary_details=[
+            SummaryDetailConfig(content="{{ missing }}"),
+        ],
+    )
+    submissions = hunt.process_query_results([{"other": i} for i in range(10)])
+    assert len(submissions) == 1
+    assert len(submissions[0].root.summary_details) == 1
 
 
 @pytest.mark.unit
